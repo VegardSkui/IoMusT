@@ -6,14 +6,14 @@ use std::sync::{Arc, RwLock};
 
 struct Peer {
     addr: SocketAddr,
-    _last_received_serial: u16,
+    last_received_serial: u16,
 }
 
 impl Peer {
     pub fn new(addr: SocketAddr) -> Peer {
         Peer {
             addr,
-            _last_received_serial: 1,
+            last_received_serial: 0,
         }
     }
 }
@@ -87,13 +87,26 @@ fn main() {
     }
     // TODO: Support all sample formats
 
+    let mut serial: u16 = 1;
+    let send_instants = Arc::new(RwLock::new(HashMap::<u16, std::time::Instant>::new()));
+
     // Build the input stream
     let input_stream = input_device
         .build_input_stream(
             &input_stream_config,
             {
                 let peers = peers.clone();
+                let send_instants = send_instants.clone();
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Store the instant the input is received (before processing and sending) for
+                    // every 2^10 = 1024 input
+                    if serial.trailing_zeros() >= 10 {
+                        send_instants
+                            .write()
+                            .unwrap()
+                            .insert(serial, std::time::Instant::now());
+                    }
+
                     // Map the audio data to a little-endian byte vector
                     let sample_bytes: Vec<u8> = data
                         .iter()
@@ -102,13 +115,24 @@ fn main() {
 
                     // NOTE: As long as we agree on the native endianess we could skip the above
                     // conversion and just transmute the type of "data".
+                    // But this should just be a no-op if it matches anyways? Can we verify this?
+                    // (maybe with Compiler Explorer, godbolt.org)
 
                     // Send the data to each peer
                     for peer in peers.read().unwrap().values() {
-                        let payload = [&[0u8; 8], sample_bytes.as_slice()].concat();
+                        let payload = [
+                            &serial.to_le_bytes(),
+                            &peer.last_received_serial.to_le_bytes(),
+                            sample_bytes.as_slice(),
+                        ]
+                        .concat();
                         send.send_to(&payload, &peer.addr)
                             .expect("could not send data");
                     }
+
+                    // NOTE: This overflows quite quickly due to only being a u16, consider
+                    // changing
+                    serial += 1;
                 }
             },
             |err| {
@@ -137,24 +161,45 @@ fn main() {
 
     // Read received packets
     loop {
-        let mut buf = [0; 520];
+        // buffer size of 64 * 2 channels * 4 bytes per sample + 2 bytes for series + 2 bytes for
+        // last received series
+        let mut buf = [0; 64 * 2 * 4 + 2 + 2];
         let (_amt, src) = recv.recv_from(&mut buf).expect("could not receive");
 
         // Skip packets not from one of our peers
-        if !peers.read().unwrap().contains_key(&src) {
-            continue;
-        };
+        if let Some(mut peer) = peers.write().unwrap().get_mut(&src) {
+            let (serial_bytes, buf) = buf.split_at(2);
+            let (last_received_seriel_bytes, sample_bytes) = buf.split_at(2);
 
-        let (_, sample_bytes) = buf.split_at(8);
+            peer.last_received_serial = u16::from_le_bytes(serial_bytes.try_into().unwrap());
 
-        // Decode the received samples back to f32
-        let samples: [f32; 128] = sample_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect::<Vec<f32>>()[..128]
-            .try_into()
-            .unwrap();
-        output_manager.add_samples(&src, &samples);
+            // Print the upper bound on delay using the time difference from when we sent a sample
+            // to when we received a sample where the last received sample of our peer is that
+            // sample. This will print a huge overestimate if one of the packets we measure are
+            // lost or the next is received by our peer before they get to send out a packet with
+            // last_received_series set to our measurement series.
+            let last_received_serial =
+                u16::from_le_bytes(last_received_seriel_bytes.try_into().unwrap());
+            if last_received_serial.trailing_zeros() >= 10 && last_received_serial != 0 {
+                // TODO: Remove the second unwrap here as it could potentially lead to a crash
+                let elapsed = send_instants
+                    .read()
+                    .unwrap()
+                    .get(&last_received_serial)
+                    .unwrap()
+                    .elapsed();
+                println!("upper bound on delay from {} is {:#?}", src, elapsed);
+            }
+
+            // Decode the received samples back to f32
+            let samples: [f32; 128] = sample_bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<f32>>()[..128]
+                .try_into()
+                .unwrap();
+            output_manager.add_samples(&src, &samples);
+        }
     }
 }
 
