@@ -3,6 +3,4 @@ members = [
     "iomust_peer",
     "iomust_signaling_messages",
     "iomust_signaling_server",
-    "receiver",
-    "sender",
 ]
