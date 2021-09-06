@@ -21,7 +21,7 @@ impl Peer {
 fn main() {
     // Initialize logging
     env_logger::init();
-    log::info!("launching iomust-dual");
+    log::info!("launching iomust_peer");
 
     let address = std::env::args().nth(1).expect("missing address argument");
 
@@ -36,8 +36,13 @@ fn main() {
     // Create a HashMap to store our peers
     let peers = Arc::new(RwLock::new(HashMap::<SocketAddr, Peer>::new()));
 
-    // Get the default audio host
+    // Get the default audio host on non-Windows platforms. On Windows, specifically request the
+    // ASIO host in order to let us specify the buffer size.
+    #[cfg(not(target_os = "windows"))]
     let host = cpal::default_host();
+    #[cfg(target_os = "windows")]
+    let host = cpal::host_from_id(cpal::HostId::Asio).expect("failed to initialize ASIO host");
+    log::info!("using audio host: {:?}", host.id());
 
     // Get the default input and output audio devices
     let input_device = host
