@@ -4,19 +4,37 @@ use std::hash::Hash;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use ringbuf::RingBuffer;
 
-// TODO: Should this be made generic over the output sample type? Another option may be to make the
-// ringbuffer operate on cpal::Sample.
 pub struct OutputManager<T: Eq + Hash> {
     device: cpal::Device,
     stream_config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
     streams: HashMap<T, cpal::Stream>,
 }
 
 impl<T: Eq + Hash> OutputManager<T> {
-    pub fn new(device: cpal::Device, stream_config: cpal::StreamConfig) -> Self {
+    /// Creates a new output manager for the given output device.
+    pub fn new(device: cpal::Device) -> Self {
+        let supported_config = device
+            .default_output_config()
+            .expect("no default output config");
+
+        // Use the minimum supported buffer size, or the default if the supported range is unknown
+        let mut stream_config = supported_config.config();
+        stream_config.buffer_size = match supported_config.buffer_size() {
+            cpal::SupportedBufferSize::Range { min, max: _max } => cpal::BufferSize::Fixed(*min),
+            cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+        };
+
+        log::debug!(
+            "using supported output stream config: {:?}",
+            supported_config
+        );
+        log::debug!("using output stream config: {:?}", stream_config);
+
         OutputManager {
             device,
             stream_config,
+            sample_format: supported_config.sample_format(),
             streams: HashMap::new(),
         }
     }
@@ -26,29 +44,52 @@ impl<T: Eq + Hash> OutputManager<T> {
     /// The stream starts playing immediately. Use the returned producer half to add samples to be
     /// played.
     #[must_use]
-    pub fn add(&mut self, ident: T) -> ringbuf::Producer<f32> {
+    pub fn add(&mut self, ident: T) -> ringbuf::Producer<u16> {
         // Create a ring buffer for the new output stream
         // TODO: Should probably come up with a value other than just guessing
         let buffer = RingBuffer::new(2048);
 
         // Split the buffer into a producer and consumer
-        let (producer, mut consumer) = buffer.split();
+        let (producer, consumer) = buffer.split();
 
-        // Build a new output stream
-        let stream = self
-            .device
-            .build_output_stream(
-                &self.stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        // Use a function to build the data function to be used by the new output stream in order
+        // to make it generic over the sample type
+        fn build_data_fn<T: cpal::Sample>(
+            mut consumer: ringbuf::Consumer<u16>,
+        ) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) {
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                for sample in data {
                     // Play data from the ring buffer. If the buffer contains no more data, play
                     // silence.
-                    for sample in data {
-                        *sample = consumer.pop().unwrap_or(0.0);
-                    }
-                },
-                |err| panic!("output err: {:?}", err),
-            )
-            .expect("could not build output stream");
+                    *sample = match consumer.pop() {
+                        Some(sample) => cpal::Sample::from(&sample),
+                        None => cpal::Sample::from(&0.0),
+                    };
+                }
+            }
+        }
+
+        let err_fn = |err| panic!("output err: {:?}", err);
+
+        // Build the new output stream
+        let stream = match self.sample_format {
+            cpal::SampleFormat::I16 => self.device.build_output_stream(
+                &self.stream_config,
+                build_data_fn::<i16>(consumer),
+                err_fn,
+            ),
+            cpal::SampleFormat::U16 => self.device.build_output_stream(
+                &self.stream_config,
+                build_data_fn::<u16>(consumer),
+                err_fn,
+            ),
+            cpal::SampleFormat::F32 => self.device.build_output_stream(
+                &self.stream_config,
+                build_data_fn::<f32>(consumer),
+                err_fn,
+            ),
+        }
+        .expect("could not build output stream");
 
         // Play the output stream
         stream.play().expect("could not play output stream");

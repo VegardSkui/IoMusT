@@ -71,89 +71,90 @@ fn main() {
             .expect("could not get output device name")
     );
 
-    // Get configurations for input and output
+    // Get input stream configuration
     let supported_input_stream_config = get_supported_input_stream_config(&input_device);
     let input_stream_config = get_stream_config(&supported_input_stream_config);
-    log::info!(
+    log::debug!(
         "using supported input stream config: {:?}",
         supported_input_stream_config
     );
-    let supported_output_stream_config = get_supported_output_stream_config(&output_device);
-    let output_stream_config = get_stream_config(&supported_output_stream_config);
-    log::info!(
-        "using output stream config: {:?}",
-        supported_output_stream_config
-    );
+    log::debug!("using input stream config: {:?}", input_stream_config);
 
-    // Error if not using f32 samples
-    if supported_input_stream_config.sample_format() != cpal::SampleFormat::F32 {
-        panic!("unsupported sample format on the input stream");
-    }
-    if supported_output_stream_config.sample_format() != cpal::SampleFormat::F32 {
-        panic!("unsupported sample format on the output stream");
-    }
-    // TODO: Support all sample formats
-
-    let mut serial: u16 = 1;
     let send_instants = Arc::new(RwLock::new(HashMap::<u16, std::time::Instant>::new()));
 
+    // Use a function to build the data function for the input stream in order to make it generic
+    // over the sample format
+    fn build_data_fn<T: cpal::Sample>(
+        send: Arc<UdpSocket>,
+        peers: Arc<RwLock<HashMap<SocketAddr, Peer>>>,
+        send_instants: Arc<RwLock<HashMap<u16, std::time::Instant>>>,
+    ) -> impl FnMut(&[T], &cpal::InputCallbackInfo) {
+        let mut serial: u16 = 1;
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            // Store the instant the input is received (before processing and sending) for every
+            // 2^10 = 1024 input
+            if serial.trailing_zeros() >= 10 {
+                send_instants
+                    .write()
+                    .unwrap()
+                    .insert(serial, std::time::Instant::now());
+            }
+            // Map the audio data to a little-endian byte vector
+            let sample_bytes: Vec<u8> = data
+                .iter()
+                .flat_map(|sample| sample.to_u16().to_le_bytes())
+                .collect();
+
+            // NOTE: As long as we agree on the native endianess we could skip the above conversion
+            // and just transmute the type of "data".
+            // But this should just be a no-op if it matches anyways? Can we verify this?  (maybe
+            // with Compiler Explorer, godbolt.org)
+
+            // Send the data to each peer
+            for peer in peers.read().unwrap().values() {
+                let payload = [
+                    &serial.to_le_bytes(),
+                    &peer.last_received_serial.to_le_bytes(),
+                    sample_bytes.as_slice(),
+                ]
+                .concat();
+                send.send_to(&payload, &peer.addr)
+                    .expect("could not send data");
+            }
+
+            // Increment the serial number, wrapping around on overflow
+            serial = serial.wrapping_add(1);
+        }
+    }
+
+    let err_fn = |err| panic!("input err: {:?}", err);
+
     // Build the input stream
-    let input_stream = input_device
-        .build_input_stream(
+    let input_stream = match supported_input_stream_config.sample_format() {
+        cpal::SampleFormat::I16 => input_device.build_input_stream(
             &input_stream_config,
-            {
-                let peers = peers.clone();
-                let send_instants = send_instants.clone();
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    // Store the instant the input is received (before processing and sending) for
-                    // every 2^10 = 1024 input
-                    if serial.trailing_zeros() >= 10 {
-                        send_instants
-                            .write()
-                            .unwrap()
-                            .insert(serial, std::time::Instant::now());
-                    }
-
-                    // Map the audio data to a little-endian byte vector
-                    let sample_bytes: Vec<u8> = data
-                        .iter()
-                        .flat_map(|sample| sample.to_le_bytes())
-                        .collect();
-
-                    // NOTE: As long as we agree on the native endianess we could skip the above
-                    // conversion and just transmute the type of "data".
-                    // But this should just be a no-op if it matches anyways? Can we verify this?
-                    // (maybe with Compiler Explorer, godbolt.org)
-
-                    // Send the data to each peer
-                    for peer in peers.read().unwrap().values() {
-                        let payload = [
-                            &serial.to_le_bytes(),
-                            &peer.last_received_serial.to_le_bytes(),
-                            sample_bytes.as_slice(),
-                        ]
-                        .concat();
-                        send.send_to(&payload, &peer.addr)
-                            .expect("could not send data");
-                    }
-
-                    // NOTE: This overflows quite quickly due to only being a u16, consider
-                    // changing
-                    serial += 1;
-                }
-            },
-            |err| {
-                panic!("input err: {:?}", err);
-            },
-        )
-        .expect("could not build input stream");
+            build_data_fn::<i16>(send, peers.clone(), send_instants.clone()),
+            err_fn,
+        ),
+        cpal::SampleFormat::U16 => input_device.build_input_stream(
+            &input_stream_config,
+            build_data_fn::<u16>(send, peers.clone(), send_instants.clone()),
+            err_fn,
+        ),
+        cpal::SampleFormat::F32 => input_device.build_input_stream(
+            &input_stream_config,
+            build_data_fn::<f32>(send, peers.clone(), send_instants.clone()),
+            err_fn,
+        ),
+    }
+    .expect("could not build input stream");
 
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
     // Store the producer for each peer in a hashmap
     let producers = Arc::new(RwLock::new(
-        HashMap::<SocketAddr, ringbuf::Producer<f32>>::new(),
+        HashMap::<SocketAddr, ringbuf::Producer<u16>>::new(),
     ));
 
     std::thread::spawn({
@@ -163,8 +164,7 @@ fn main() {
         move || {
             // Create a new audio output manager to playback audio received from our peers. Using
             // the peer's address as the key.
-            let mut output_manager =
-                OutputManager::<SocketAddr>::new(output_device, output_stream_config);
+            let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
 
             // Open a TCP conneciton to the signaling server
             let stream = TcpStream::connect(signaling_server_addr)
@@ -212,15 +212,15 @@ fn main() {
 
     // Read received packets from peers
     loop {
-        // buffer size of 64 * 2 channels * 4 bytes per sample + 2 bytes for series + 2 bytes for
+        // buffer size of 64 * 2 channels * 2 bytes per sample + 2 bytes for series + 2 bytes for
         // last received series
-        let mut buf = [0; 64 * 2 * 4 + 2 + 2];
-        let (_amt, src) = recv.recv_from(&mut buf).expect("could not receive");
+        let mut buf = [0; 64 * 2 * 2 + 2 + 2];
+        let (amt, src) = recv.recv_from(&mut buf).expect("could not receive");
 
         // Skip packets not from one of our peers
         if let Some(mut peer) = peers.write().unwrap().get_mut(&src) {
             let (serial_bytes, buf) = buf.split_at(2);
-            let (last_received_seriel_bytes, sample_bytes) = buf.split_at(2);
+            let (last_received_serial_bytes, sample_bytes) = buf.split_at(2);
 
             peer.last_received_serial = u16::from_le_bytes(serial_bytes.try_into().unwrap());
 
@@ -230,7 +230,7 @@ fn main() {
             // lost or the next is received by our peer before they get to send out a packet with
             // last_received_series set to our measurement series.
             let last_received_serial =
-                u16::from_le_bytes(last_received_seriel_bytes.try_into().unwrap());
+                u16::from_le_bytes(last_received_serial_bytes.try_into().unwrap());
             if last_received_serial.trailing_zeros() >= 10 && last_received_serial != 0 {
                 // TODO: Remove the second unwrap here as it could potentially lead to a crash
                 let elapsed = send_instants
@@ -242,13 +242,15 @@ fn main() {
                 log::trace!("upper bound on delay from `{}` is {:#?}", src, elapsed);
             }
 
-            // Decode the received samples back to f32 and add them to the peer's producer for
+            // Decode the received samples back to u16 and add them to the peer's producer for
             // playback
             if let Some(producer) = producers.write().unwrap().get_mut(&peer.addr) {
                 producer.push_iter(
-                    &mut sample_bytes
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+                    // The number of sample bytes is the total received buffer length minus the 4
+                    // bytes used for serial and last_received_serial
+                    &mut sample_bytes[..amt - 4]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
                 );
             }
         }
@@ -259,12 +261,6 @@ fn get_supported_input_stream_config(device: &cpal::Device) -> cpal::SupportedSt
     device
         .default_input_config()
         .expect("no default input config")
-}
-
-fn get_supported_output_stream_config(device: &cpal::Device) -> cpal::SupportedStreamConfig {
-    device
-        .default_output_config()
-        .expect("no default output config")
 }
 
 fn get_stream_config(supported_config: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
