@@ -1,8 +1,11 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::{Arc, RwLock};
+
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use iomust_signaling_messages::{ClientMessage, ServerMessage};
+use serde::Deserialize;
 
 use crate::output::OutputManager;
 
@@ -27,13 +30,13 @@ fn main() {
     env_logger::init();
     log::info!("launching iomust_peer");
 
-    let address = std::env::args().nth(1).expect("missing address argument");
-
-    let peer_addresses: Vec<String> = std::env::args().skip(2).collect();
+    let signaling_server_addr = std::env::args()
+        .nth(1)
+        .expect("missing signaling server address argument");
 
     // Bind a UDP socket
-    let socket = UdpSocket::bind(address).expect("could not bind to address");
-    log::info!("bound to {}", socket.local_addr().unwrap());
+    let socket = UdpSocket::bind("0:0").expect("could not bind to address");
+    log::info!("bound to `{}`", socket.local_addr().unwrap());
     let recv = Arc::new(socket);
     let send = recv.clone();
 
@@ -148,22 +151,66 @@ fn main() {
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
-    // Create a new audio output manager to playback audio received from our peers. Using the
-    // peer's address as the key.
-    let mut output_manager = OutputManager::<SocketAddr>::new(output_device, output_stream_config);
-
     // Store the producer for each peer in a hashmap
-    let mut producers: HashMap<SocketAddr, ringbuf::Producer<f32>> = HashMap::new();
+    let producers = Arc::new(RwLock::new(
+        HashMap::<SocketAddr, ringbuf::Producer<f32>>::new(),
+    ));
 
-    // Add outputs for the supplied peer addresses
-    for peer_addr in peer_addresses {
-        let peer = Peer::new(peer_addr.parse().unwrap());
-        let producer = output_manager.add(peer.addr);
-        producers.insert(peer.addr, producer);
-        peers.write().unwrap().insert(peer.addr, peer);
-    }
+    std::thread::spawn({
+        let port = recv.local_addr().unwrap().port();
+        let peers = peers.clone();
+        let producers = producers.clone();
+        move || {
+            // Create a new audio output manager to playback audio received from our peers. Using
+            // the peer's address as the key.
+            let mut output_manager =
+                OutputManager::<SocketAddr>::new(output_device, output_stream_config);
 
-    // Read received packets
+            // Open a TCP conneciton to the signaling server
+            let stream = TcpStream::connect(signaling_server_addr)
+                .expect("could not connect to the signaling server");
+            log::info!(
+                "connected to signaling server at `{}`",
+                stream.peer_addr().unwrap()
+            );
+
+            // Send a Hey message to the signaling server to connect us with other peers
+            {
+                let stream = stream.try_clone().expect("could not clone stream");
+                let hey = ClientMessage::Hey {
+                    name: String::from("Unnamed Peer"),
+                    port,
+                };
+                serde_json::to_writer(stream, &hey)
+                    .expect("serializing and sending hey message to the signaling server failed");
+            }
+
+            // Read messages from the signaling server as they arrive
+            let mut de = serde_json::Deserializer::from_reader(stream);
+            loop {
+                match ServerMessage::deserialize(&mut de) {
+                    Ok(message) => match message {
+                        ServerMessage::Connected { addr } => {
+                            log::info!("peer `{}` connected", addr);
+                            let peer = Peer::new(addr);
+                            let producer = output_manager.add(peer.addr);
+                            producers.write().unwrap().insert(peer.addr, producer);
+                            peers.write().unwrap().insert(peer.addr, peer);
+                        }
+                        ServerMessage::Disconnected { addr } => {
+                            log::info!("peer `{}` disconnected", addr);
+                            output_manager.remove(&addr);
+                            producers.write().unwrap().remove(&addr);
+                            peers.write().unwrap().remove(&addr);
+                        }
+                    },
+                    Err(e) => panic!("deserializing server message failed with error: {}", e),
+                }
+            }
+        }
+    });
+
+    // Read received packets from peers
     loop {
         // buffer size of 64 * 2 channels * 4 bytes per sample + 2 bytes for series + 2 bytes for
         // last received series
@@ -192,12 +239,12 @@ fn main() {
                     .get(&last_received_serial)
                     .unwrap()
                     .elapsed();
-                println!("upper bound on delay from {} is {:#?}", src, elapsed);
+                log::trace!("upper bound on delay from `{}` is {:#?}", src, elapsed);
             }
 
             // Decode the received samples back to f32 and add them to the peer's producer for
             // playback
-            if let Some(producer) = producers.get_mut(&peer.addr) {
+            if let Some(producer) = producers.write().unwrap().get_mut(&peer.addr) {
                 producer.push_iter(
                     &mut sample_bytes
                         .chunks_exact(4)

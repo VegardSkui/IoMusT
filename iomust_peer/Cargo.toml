@@ -6,5 +6,8 @@ edition = "2018"
 [dependencies]
 cpal = { version = "0.13", features = ["asio"] }
 env_logger = "0.9"
+iomust_signaling_messages = { path = "../iomust_signaling_messages" }
 log = "0.4"
 ringbuf = "0.2"
+serde = "1.0"
+serde_json = "1.0"

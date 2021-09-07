@@ -3,7 +3,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 
 use iomust_signaling_messages::{ClientMessage, ServerMessage};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 struct Peer {
     /// The audio UDP address of the peer. The existence of this address is equivalent to the peer
@@ -91,8 +91,13 @@ fn main() {
                 match message {
                     ClientMessage::Alive => todo!(),
                     ClientMessage::Bye => todo!(),
-                    ClientMessage::Hey { name, addr } => {
+                    ClientMessage::Hey { name, port } => {
                         // TODO: Make sure the peer isn't already connected with audio
+
+                        // The actual audio address of the peer is it's source address and the
+                        // provided audio port number
+                        let mut addr = source_addr;
+                        addr.set_port(port);
 
                         log::info!(
                             "`{}` connected as `{}` using audio addr `{}`",
@@ -131,11 +136,11 @@ fn main() {
                     // Create a JSON serializer for the peer's stream. Again, it should be okay to
                     // clone the stream for the same reasons as given in the previous loop.
                     let stream = peer.stream.try_clone().expect("could not clone stream");
-                    let mut ser = serde_json::Serializer::new(stream);
+
+                    log::trace!("sending message to `{}`: {:?}", dest_addr, message);
 
                     // Serialize the message and send it to the destination
-                    message
-                        .serialize(&mut ser)
+                    serde_json::to_writer(stream, &message)
                         .expect("serializing and writing message failed");
                 }
             }

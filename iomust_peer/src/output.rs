@@ -59,4 +59,9 @@ impl<T: Eq + Hash> OutputManager<T> {
         // Return the producer half of the ring buffer
         producer
     }
+
+    pub fn remove(&mut self, ident: &T) {
+        // Drop the output stream
+        self.streams.remove(ident);
+    }
 }
