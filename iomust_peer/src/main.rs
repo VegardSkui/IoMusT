@@ -1,8 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock};
+
+use crate::output::OutputManager;
+
+mod output;
 
 struct Peer {
     addr: SocketAddr,
@@ -144,18 +148,18 @@ fn main() {
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
-    // Create a new peer outputs manager
-    let mut output_manager = PeerOutputsManager {
-        output_device: &output_device,
-        output_stream_config: &output_stream_config,
-        streams: HashMap::new(),
-        buffers: HashMap::new(),
-    };
+    // Create a new audio output manager to playback audio received from our peers. Using the
+    // peer's address as the key.
+    let mut output_manager = OutputManager::<SocketAddr>::new(output_device, output_stream_config);
+
+    // Store the producer for each peer in a hashmap
+    let mut producers: HashMap<SocketAddr, ringbuf::Producer<f32>> = HashMap::new();
 
     // Add outputs for the supplied peer addresses
     for peer_addr in peer_addresses {
         let peer = Peer::new(peer_addr.parse().unwrap());
-        output_manager.add_peer(&peer);
+        let producer = output_manager.add(peer.addr);
+        producers.insert(peer.addr, producer);
         peers.write().unwrap().insert(peer.addr, peer);
     }
 
@@ -191,73 +195,16 @@ fn main() {
                 println!("upper bound on delay from {} is {:#?}", src, elapsed);
             }
 
-            // Decode the received samples back to f32
-            let samples: [f32; 128] = sample_bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect::<Vec<f32>>()[..128]
-                .try_into()
-                .unwrap();
-            output_manager.add_samples(&src, &samples);
+            // Decode the received samples back to f32 and add them to the peer's producer for
+            // playback
+            if let Some(producer) = producers.get_mut(&peer.addr) {
+                producer.push_iter(
+                    &mut sample_bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
+                );
+            }
         }
-    }
-}
-
-// TODO: Could this be generic over the output stream config? At least the sample type?
-struct PeerOutputsManager<'a> {
-    output_device: &'a cpal::Device,
-    output_stream_config: &'a cpal::StreamConfig,
-    streams: HashMap<SocketAddr, cpal::Stream>,
-    buffers: HashMap<SocketAddr, Arc<RwLock<VecDeque<[f32; 128]>>>>,
-}
-
-impl<'a> PeerOutputsManager<'a> {
-    fn add_peer(&mut self, peer: &Peer) {
-        log::info!("building output stream for {}", peer.addr);
-
-        // Create an empty buffer for the stream
-        let buffer = Arc::new(RwLock::new(VecDeque::new()));
-        self.buffers.insert(peer.addr, buffer.clone());
-
-        // Build a new output stream
-        let output_stream = self
-            .output_device
-            .build_output_stream(
-                self.output_stream_config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if let Some(mut samples) = buffer.write().unwrap().pop_front() {
-                        // NOTE: This will panic if data is somehow longer than samples
-                        data.swap_with_slice(&mut samples[..data.len()]);
-                    } else {
-                        // Play silence
-                        for sample in data.iter_mut() {
-                            *sample = cpal::Sample::from(&0.0);
-                        }
-                    }
-                },
-                |err| {
-                    panic!("output err: {:?}", err);
-                },
-            )
-            .expect("could not build output stream");
-
-        // Play the stream
-        output_stream.play().expect("could not play output stream");
-
-        // Store the stream so it doesn't drop immediately
-        self.streams.insert(peer.addr, output_stream);
-    }
-
-    fn add_samples(&mut self, source: &SocketAddr, samples: &[f32; 128]) {
-        // TODO: Return an error instead of panic on the first unwrap.
-        // Even though it should never happen if we remember to call add_peer (and later
-        // remove_peer?) as appropriate.
-        self.buffers
-            .get_mut(source)
-            .unwrap()
-            .write()
-            .unwrap()
-            .push_back(*samples);
     }
 }
 
