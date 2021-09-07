@@ -2,13 +2,17 @@ use std::collections::HashMap;
 use std::hash::Hash;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
+use fragile::Fragile;
 use ringbuf::RingBuffer;
 
 pub struct OutputManager<T: Eq + Hash> {
     device: cpal::Device,
     stream_config: cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    streams: HashMap<T, cpal::Stream>,
+    // TODO: It would be nice to find a way around using the `fragile` crate. For now it's required
+    // because we need `OutputManager` to be `Send`, but `cpal::Stream` is not `Send`. This is
+    // related to the instruction in the `remove` method.
+    streams: HashMap<T, Fragile<cpal::Stream>>,
 }
 
 impl<T: Eq + Hash> OutputManager<T> {
@@ -95,12 +99,15 @@ impl<T: Eq + Hash> OutputManager<T> {
         stream.play().expect("could not play output stream");
 
         // Store the stream so it doesn't drop immediately
-        self.streams.insert(ident, stream);
+        self.streams.insert(ident, Fragile::new(stream));
 
         // Return the producer half of the ring buffer
         producer
     }
 
+    /// Removes the output stream associated with the given identifier.
+    ///
+    /// Must be called from the same thread which added the stream.
     pub fn remove(&mut self, ident: &T) {
         // Drop the output stream
         self.streams.remove(ident);

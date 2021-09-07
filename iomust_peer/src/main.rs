@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 use std::convert::TryInto;
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iomust_signaling_messages::{ClientMessage, ServerMessage};
-use serde::Deserialize;
 
 use crate::output::OutputManager;
+use crate::signaling::SignalingConnection;
 
 mod output;
+mod signaling;
 
 struct Peer {
     addr: SocketAddr,
@@ -157,58 +158,40 @@ fn main() {
         HashMap::<SocketAddr, ringbuf::Producer<u16>>::new(),
     ));
 
-    std::thread::spawn({
-        let port = recv.local_addr().unwrap().port();
+    let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
+
+    // Connect to the signaling server
+    let signaling_conn = SignalingConnection::connect(signaling_server_addr)
+        .expect("could not connect to the signaling server");
+
+    // Handle incoming messages from the signaling server
+    signaling_conn.set_callback({
         let peers = peers.clone();
         let producers = producers.clone();
-        move || {
-            // Create a new audio output manager to playback audio received from our peers. Using
-            // the peer's address as the key.
-            let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
-
-            // Open a TCP conneciton to the signaling server
-            let stream = TcpStream::connect(signaling_server_addr)
-                .expect("could not connect to the signaling server");
-            log::info!(
-                "connected to signaling server at `{}`",
-                stream.peer_addr().unwrap()
-            );
-
-            // Send a Hey message to the signaling server to connect us with other peers
-            {
-                let stream = stream.try_clone().expect("could not clone stream");
-                let hey = ClientMessage::Hey {
-                    name: String::from("Unnamed Peer"),
-                    port,
-                };
-                serde_json::to_writer(stream, &hey)
-                    .expect("serializing and sending hey message to the signaling server failed");
+        move |message: ServerMessage| match message {
+            ServerMessage::Connected { addr } => {
+                log::info!("peer `{}` connected", addr);
+                let peer = Peer::new(addr);
+                let producer = output_manager.add(addr);
+                peers.write().unwrap().insert(addr, peer);
+                producers.write().unwrap().insert(addr, producer);
             }
-
-            // Read messages from the signaling server as they arrive
-            let mut de = serde_json::Deserializer::from_reader(stream);
-            loop {
-                match ServerMessage::deserialize(&mut de) {
-                    Ok(message) => match message {
-                        ServerMessage::Connected { addr } => {
-                            log::info!("peer `{}` connected", addr);
-                            let peer = Peer::new(addr);
-                            let producer = output_manager.add(peer.addr);
-                            producers.write().unwrap().insert(peer.addr, producer);
-                            peers.write().unwrap().insert(peer.addr, peer);
-                        }
-                        ServerMessage::Disconnected { addr } => {
-                            log::info!("peer `{}` disconnected", addr);
-                            output_manager.remove(&addr);
-                            producers.write().unwrap().remove(&addr);
-                            peers.write().unwrap().remove(&addr);
-                        }
-                    },
-                    Err(e) => panic!("deserializing server message failed with error: {}", e),
-                }
+            ServerMessage::Disconnected { addr } => {
+                log::info!("peer `{}` disconnected", addr);
+                output_manager.remove(&addr);
+                peers.write().unwrap().remove(&addr);
+                producers.write().unwrap().remove(&addr);
             }
         }
     });
+
+    // Send a hey message to the signaling server to connect us with other peers
+    signaling_conn
+        .send(&ClientMessage::Hey {
+            name: String::from("Unnamed Peer"),
+            port: recv.local_addr().unwrap().port(),
+        })
+        .expect("sending hey message to the signaling server failed");
 
     // Read received packets from peers
     loop {
