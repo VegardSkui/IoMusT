@@ -36,7 +36,7 @@ fn main() {
         .expect("missing signaling server address argument");
 
     // Bind a UDP socket
-    let socket = UdpSocket::bind("0:0").expect("could not bind to address");
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("could not bind to address");
     log::info!("bound to `{}`", socket.local_addr().unwrap());
     let recv = Arc::new(socket);
     let send = recv.clone();
@@ -44,12 +44,8 @@ fn main() {
     // Create a HashMap to store our peers
     let peers = Arc::new(RwLock::new(HashMap::<SocketAddr, Peer>::new()));
 
-    // Get the default audio host on non-Windows platforms. On Windows, specifically request the
-    // ASIO host in order to let us specify the buffer size.
-    #[cfg(not(target_os = "windows"))]
+    // Get the default audio host
     let host = cpal::default_host();
-    #[cfg(target_os = "windows")]
-    let host = cpal::host_from_id(cpal::HostId::Asio).expect("failed to initialize ASIO host");
     log::info!("using audio host: {:?}", host.id());
 
     // Get the default input and output audio devices
@@ -73,8 +69,18 @@ fn main() {
     );
 
     // Get input stream configuration
-    let supported_input_stream_config = get_supported_input_stream_config(&input_device);
-    let input_stream_config = get_stream_config(&supported_input_stream_config);
+    let supported_input_stream_config = input_device
+        .default_input_config()
+        .expect("no default input config");
+    // Prefer a buffer size of 64, but clamp to be within the supported range. Use the default
+    // buffer size if the supported range is unknown.
+    let mut input_stream_config = supported_input_stream_config.config();
+    input_stream_config.buffer_size = match supported_input_stream_config.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed(64.max(*min).min(*max))
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    };
     log::debug!(
         "using supported input stream config: {:?}",
         supported_input_stream_config
@@ -195,9 +201,15 @@ fn main() {
 
     // Read received packets from peers
     loop {
-        // buffer size of 64 * 2 channels * 2 bytes per sample + 2 bytes for series + 2 bytes for
+        // buffer size of 256 * 2 channels * 2 bytes per sample + 2 bytes for series + 2 bytes for
         // last received series
-        let mut buf = [0; 64 * 2 * 2 + 2 + 2];
+        // TODO: This should probably be somewhat dynamic to support unknown buffer sized for our
+        // peers. Alternatively we can `expect` the input buffer size to be less than a given value
+        // when configuring the input, and then use that maximum size of buffer here. It should not
+        // be unbounded dynamic as that opens us up to memory exhaustion attacks. If we see an
+        // input configuration larger than the maximum supported audio packet size we could split
+        // it across multiple packets.
+        let mut buf = [0; 256 * 2 * 2 + 2 + 2];
         let (amt, src) = recv.recv_from(&mut buf).expect("could not receive");
 
         // Skip packets not from one of our peers
@@ -238,16 +250,4 @@ fn main() {
             }
         }
     }
-}
-
-fn get_supported_input_stream_config(device: &cpal::Device) -> cpal::SupportedStreamConfig {
-    device
-        .default_input_config()
-        .expect("no default input config")
-}
-
-fn get_stream_config(supported_config: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
-    let mut config = supported_config.config();
-    config.buffer_size = cpal::BufferSize::Fixed(64);
-    config
 }

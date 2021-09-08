@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-cpal = { version = "0.13", features = ["asio"] }
+cpal = "0.13"
 env_logger = "0.9"
 fragile = "1.0"
 iomust_signaling_messages = { path = "../iomust_signaling_messages" }
