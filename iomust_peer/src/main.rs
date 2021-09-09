@@ -77,7 +77,7 @@ fn main() {
     let mut input_stream_config = supported_input_stream_config.config();
     input_stream_config.buffer_size = match supported_input_stream_config.buffer_size() {
         cpal::SupportedBufferSize::Range { min, max } => {
-            cpal::BufferSize::Fixed(64.max(*min).min(*max))
+            cpal::BufferSize::Fixed(64.clamp(*min, *max))
         }
         cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
     };

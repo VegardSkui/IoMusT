@@ -27,7 +27,7 @@ impl<T: Eq + Hash> OutputManager<T> {
         let mut stream_config = supported_config.config();
         stream_config.buffer_size = match supported_config.buffer_size() {
             cpal::SupportedBufferSize::Range { min, max } => {
-                cpal::BufferSize::Fixed(64.max(*min).min(*max))
+                cpal::BufferSize::Fixed(64.clamp(*min, *max))
             }
             cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
         };
