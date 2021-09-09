@@ -68,10 +68,22 @@ fn main() {
             .expect("could not get output device name")
     );
 
-    // Get input stream configuration
+    // Get input stream configuration, preferring a sample rate of 48 kHz, but falling back to the
+    // device's default
+    let preferred_sample_rate = cpal::SampleRate(48000);
     let supported_input_stream_config = input_device
-        .default_input_config()
-        .expect("no default input config");
+        .supported_input_configs()
+        .unwrap()
+        .find(|config| {
+            config.min_sample_rate() <= preferred_sample_rate
+                && config.max_sample_rate() >= preferred_sample_rate
+        })
+        .map(|config| config.with_sample_rate(preferred_sample_rate))
+        .unwrap_or_else(|| {
+            input_device
+                .default_input_config()
+                .expect("could not get default input config")
+        });
     // Prefer a buffer size of 64, but clamp to be within the supported range. Use the default
     // buffer size if the supported range is unknown.
     let mut input_stream_config = supported_input_stream_config.config();

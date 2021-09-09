@@ -18,9 +18,22 @@ pub struct OutputManager<T: Eq + Hash> {
 impl<T: Eq + Hash> OutputManager<T> {
     /// Creates a new output manager for the given output device.
     pub fn new(device: cpal::Device) -> Self {
+        // Get output stream configuration, preferring a sample rate of 48 kHz, but falling back to
+        // the device's default
+        let preferred_sample_rate = cpal::SampleRate(48000);
         let supported_config = device
-            .default_output_config()
-            .expect("no default output config");
+            .supported_output_configs()
+            .unwrap()
+            .find(|config| {
+                config.min_sample_rate() <= preferred_sample_rate
+                    && config.max_sample_rate() >= preferred_sample_rate
+            })
+            .map(|config| config.with_sample_rate(preferred_sample_rate))
+            .unwrap_or_else(|| {
+                device
+                    .default_output_config()
+                    .expect("could not get default output config")
+            });
 
         // Prefer a buffer size of 64, but clamp to be within the supported range. Use the default
         // buffer size if the supported range is unknown.
