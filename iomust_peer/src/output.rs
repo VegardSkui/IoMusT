@@ -22,10 +22,13 @@ impl<T: Eq + Hash> OutputManager<T> {
             .default_output_config()
             .expect("no default output config");
 
-        // Use the minimum supported buffer size, or the default if the supported range is unknown
+        // Prefer a buffer size of 64, but clamp to be within the supported range. Use the default
+        // buffer size if the supported range is unknown.
         let mut stream_config = supported_config.config();
         stream_config.buffer_size = match supported_config.buffer_size() {
-            cpal::SupportedBufferSize::Range { min, max: _max } => cpal::BufferSize::Fixed(*min),
+            cpal::SupportedBufferSize::Range { min, max } => {
+                cpal::BufferSize::Fixed(64.max(*min).min(*max))
+            }
             cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
         };
 
