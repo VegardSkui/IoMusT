@@ -9,6 +9,8 @@ use std::time::Instant;
 /// The peer communicator is responsible for sending/receiving audio packets to/from connected
 /// peers. Received audio is pushed onto a peer's associated audio output buffer for playback.
 pub struct PeerCommunicator {
+    /// The number of input audio channels.
+    channels: cpal::ChannelCount,
     /// All currently connected peers. The key is the audio address of the peer, and the value is a
     /// tuple of the producer half of its associated audio output buffer and the serial number of
     /// our last received audio packet from them.
@@ -23,7 +25,7 @@ impl PeerCommunicator {
     /// Initializes a new peer communicator to listen for audio data received from peers.
     ///
     /// This will also automatically start a new thread to listen for incoming data from peers.
-    pub fn initialize() -> Result<Self, std::io::Error> {
+    pub fn initialize(channels: cpal::ChannelCount) -> Result<Self, std::io::Error> {
         // Bind a UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         log::info!("bound to `{}`", socket.local_addr().unwrap());
@@ -100,6 +102,7 @@ impl PeerCommunicator {
         });
 
         Ok(PeerCommunicator {
+            channels,
             peers,
             send_instants,
             serial: 0,
@@ -123,10 +126,10 @@ impl PeerCommunicator {
                 .insert(self.serial, Instant::now());
         }
 
-        // Map the audio data to a little-endian byte vector
+        // Downmix the audio to mono and convert to a little-endian byte vector
         let sample_bytes: Vec<u8> = samples
-            .iter()
-            .flat_map(|sample| sample.to_u16().to_le_bytes())
+            .chunks(self.channels.into())
+            .flat_map(|samples| samples[0].to_u16().to_le_bytes())
             .collect();
 
         // NOTE: As long as we agree on the native endianess we could skip the above conversion and

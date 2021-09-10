@@ -66,15 +66,19 @@ impl<T: Eq + Hash> OutputManager<T> {
         // to make it generic over the sample type
         fn build_data_fn<T: cpal::Sample>(
             mut consumer: ringbuf::Consumer<u16>,
+            channels: cpal::ChannelCount,
         ) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) {
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                for sample in data {
-                    // Play data from the buffer. If the buffer contains no more data, play
-                    // silence.
-                    *sample = match consumer.pop() {
+                for frame in data.chunks_mut(channels.into()) {
+                    // Pop a sample from the buffer, if the buffer contains no more data, play
+                    // silence
+                    let sample = match consumer.pop() {
                         Some(sample) => cpal::Sample::from(&sample),
                         None => cpal::Sample::from(&0.0),
                     };
+
+                    // Play the sample on every channel in the frame
+                    frame.fill(sample);
                 }
             }
         }
@@ -85,17 +89,17 @@ impl<T: Eq + Hash> OutputManager<T> {
         let stream = match self.sample_format {
             cpal::SampleFormat::I16 => self.device.build_output_stream(
                 &self.stream_config,
-                build_data_fn::<i16>(consumer),
+                build_data_fn::<i16>(consumer, self.stream_config.channels),
                 err_fn,
             ),
             cpal::SampleFormat::U16 => self.device.build_output_stream(
                 &self.stream_config,
-                build_data_fn::<u16>(consumer),
+                build_data_fn::<u16>(consumer, self.stream_config.channels),
                 err_fn,
             ),
             cpal::SampleFormat::F32 => self.device.build_output_stream(
                 &self.stream_config,
-                build_data_fn::<f32>(consumer),
+                build_data_fn::<f32>(consumer, self.stream_config.channels),
                 err_fn,
             ),
         }

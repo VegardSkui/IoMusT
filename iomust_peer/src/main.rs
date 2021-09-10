@@ -22,11 +22,6 @@ fn main() {
         .nth(1)
         .expect("missing signaling server address argument");
 
-    // Initialize a peer communicator
-    let peer_comm = Arc::new(RwLock::new(
-        PeerCommunicator::initialize().expect("initializing peer communicator failed"),
-    ));
-
     // Get the default audio host
     let host = cpal::default_host();
     log::info!("using audio host: {:?}", host.id());
@@ -81,6 +76,12 @@ fn main() {
         supported_input_stream_config
     );
     log::debug!("using input stream config: {:?}", input_stream_config);
+
+    // Initialize a peer communicator
+    let peer_comm = Arc::new(RwLock::new(
+        PeerCommunicator::initialize(input_stream_config.channels)
+            .expect("initializing peer communicator failed"),
+    ));
 
     // Use a function to build the data function for the input stream in order to make it generic
     // over the sample format
