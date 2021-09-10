@@ -1,30 +1,17 @@
-use std::collections::HashMap;
-use std::convert::TryInto;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iomust_signaling_messages::{ClientMessage, ServerMessage};
+use ringbuf::RingBuffer;
 
 use crate::output::OutputManager;
+use crate::peer::PeerCommunicator;
 use crate::signaling::SignalingConnection;
 
 mod output;
+mod peer;
 mod signaling;
-
-struct Peer {
-    addr: SocketAddr,
-    last_received_serial: u16,
-}
-
-impl Peer {
-    pub fn new(addr: SocketAddr) -> Peer {
-        Peer {
-            addr,
-            last_received_serial: 0,
-        }
-    }
-}
 
 fn main() {
     // Initialize logging
@@ -35,14 +22,10 @@ fn main() {
         .nth(1)
         .expect("missing signaling server address argument");
 
-    // Bind a UDP socket
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("could not bind to address");
-    log::info!("bound to `{}`", socket.local_addr().unwrap());
-    let recv = Arc::new(socket);
-    let send = recv.clone();
-
-    // Create a HashMap to store our peers
-    let peers = Arc::new(RwLock::new(HashMap::<SocketAddr, Peer>::new()));
+    // Initialize a peer communicator
+    let peer_comm = Arc::new(RwLock::new(
+        PeerCommunicator::initialize().expect("initializing peer communicator failed"),
+    ));
 
     // Get the default audio host
     let host = cpal::default_host();
@@ -99,50 +82,15 @@ fn main() {
     );
     log::debug!("using input stream config: {:?}", input_stream_config);
 
-    let send_instants = Arc::new(RwLock::new(HashMap::<u16, std::time::Instant>::new()));
-
     // Use a function to build the data function for the input stream in order to make it generic
     // over the sample format
     fn build_data_fn<T: cpal::Sample>(
-        send: Arc<UdpSocket>,
-        peers: Arc<RwLock<HashMap<SocketAddr, Peer>>>,
-        send_instants: Arc<RwLock<HashMap<u16, std::time::Instant>>>,
+        peer_comm: Arc<RwLock<PeerCommunicator>>,
     ) -> impl FnMut(&[T], &cpal::InputCallbackInfo) {
-        let mut serial: u16 = 1;
         move |data: &[T], _: &cpal::InputCallbackInfo| {
-            // Store the instant the input is received (before processing and sending) for every
-            // 2^10 = 1024 input
-            if serial.trailing_zeros() >= 10 {
-                send_instants
-                    .write()
-                    .unwrap()
-                    .insert(serial, std::time::Instant::now());
+            if let Err(err) = peer_comm.write().unwrap().send_samples(data) {
+                log::error!("sending data failed: {}", err);
             }
-            // Map the audio data to a little-endian byte vector
-            let sample_bytes: Vec<u8> = data
-                .iter()
-                .flat_map(|sample| sample.to_u16().to_le_bytes())
-                .collect();
-
-            // NOTE: As long as we agree on the native endianess we could skip the above conversion
-            // and just transmute the type of "data".
-            // But this should just be a no-op if it matches anyways? Can we verify this?  (maybe
-            // with Compiler Explorer, godbolt.org)
-
-            // Send the data to each peer
-            for peer in peers.read().unwrap().values() {
-                let payload = [
-                    &serial.to_le_bytes(),
-                    &peer.last_received_serial.to_le_bytes(),
-                    sample_bytes.as_slice(),
-                ]
-                .concat();
-                send.send_to(&payload, &peer.addr)
-                    .expect("could not send data");
-            }
-
-            // Increment the serial number, wrapping around on overflow
-            serial = serial.wrapping_add(1);
         }
     }
 
@@ -152,17 +100,17 @@ fn main() {
     let input_stream = match supported_input_stream_config.sample_format() {
         cpal::SampleFormat::I16 => input_device.build_input_stream(
             &input_stream_config,
-            build_data_fn::<i16>(send, peers.clone(), send_instants.clone()),
+            build_data_fn::<i16>(peer_comm.clone()),
             err_fn,
         ),
         cpal::SampleFormat::U16 => input_device.build_input_stream(
             &input_stream_config,
-            build_data_fn::<u16>(send, peers.clone(), send_instants.clone()),
+            build_data_fn::<u16>(peer_comm.clone()),
             err_fn,
         ),
         cpal::SampleFormat::F32 => input_device.build_input_stream(
             &input_stream_config,
-            build_data_fn::<f32>(send, peers.clone(), send_instants.clone()),
+            build_data_fn::<f32>(peer_comm.clone()),
             err_fn,
         ),
     }
@@ -171,34 +119,27 @@ fn main() {
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
-    // Store the producer for each peer in a hashmap
-    let producers = Arc::new(RwLock::new(
-        HashMap::<SocketAddr, ringbuf::Producer<u16>>::new(),
-    ));
-
-    let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
-
     // Connect to the signaling server
     let signaling_conn = SignalingConnection::connect(signaling_server_addr)
         .expect("could not connect to the signaling server");
 
     // Handle incoming messages from the signaling server
     signaling_conn.set_callback({
-        let peers = peers.clone();
-        let producers = producers.clone();
+        let peer_comm = peer_comm.clone();
+        let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
         move |message: ServerMessage| match message {
             ServerMessage::Connected { addr } => {
                 log::info!("peer `{}` connected", addr);
-                let peer = Peer::new(addr);
-                let producer = output_manager.add(addr);
-                peers.write().unwrap().insert(addr, peer);
-                producers.write().unwrap().insert(addr, producer);
+                // Create a new output buffer for the peer
+                // TODO: Come up with a buffer capacity without mostly guessing
+                let (producer, consumer) = RingBuffer::new(2048).split();
+                peer_comm.write().unwrap().add(addr, producer);
+                output_manager.add(addr, consumer);
             }
             ServerMessage::Disconnected { addr } => {
                 log::info!("peer `{}` disconnected", addr);
+                peer_comm.write().unwrap().remove(&addr);
                 output_manager.remove(&addr);
-                peers.write().unwrap().remove(&addr);
-                producers.write().unwrap().remove(&addr);
             }
         }
     });
@@ -207,59 +148,12 @@ fn main() {
     signaling_conn
         .send(&ClientMessage::Hey {
             name: String::from("Unnamed Peer"),
-            port: recv.local_addr().unwrap().port(),
+            port: peer_comm.read().unwrap().local_addr().unwrap().port(),
         })
         .expect("sending hey message to the signaling server failed");
 
-    // Read received packets from peers
+    // This main thread has nothing more to do, so park it indefinitely
     loop {
-        // buffer size of 256 * 2 channels * 2 bytes per sample + 2 bytes for series + 2 bytes for
-        // last received series
-        // TODO: This should probably be somewhat dynamic to support unknown buffer sized for our
-        // peers. Alternatively we can `expect` the input buffer size to be less than a given value
-        // when configuring the input, and then use that maximum size of buffer here. It should not
-        // be unbounded dynamic as that opens us up to memory exhaustion attacks. If we see an
-        // input configuration larger than the maximum supported audio packet size we could split
-        // it across multiple packets.
-        let mut buf = [0; 256 * 2 * 2 + 2 + 2];
-        let (amt, src) = recv.recv_from(&mut buf).expect("could not receive");
-
-        // Skip packets not from one of our peers
-        if let Some(mut peer) = peers.write().unwrap().get_mut(&src) {
-            let (serial_bytes, buf) = buf.split_at(2);
-            let (last_received_serial_bytes, sample_bytes) = buf.split_at(2);
-
-            peer.last_received_serial = u16::from_le_bytes(serial_bytes.try_into().unwrap());
-
-            // Print the upper bound on delay using the time difference from when we sent a sample
-            // to when we received a sample where the last received sample of our peer is that
-            // sample. This will print a huge overestimate if one of the packets we measure are
-            // lost or the next is received by our peer before they get to send out a packet with
-            // last_received_series set to our measurement series.
-            let last_received_serial =
-                u16::from_le_bytes(last_received_serial_bytes.try_into().unwrap());
-            if last_received_serial.trailing_zeros() >= 10 && last_received_serial != 0 {
-                // TODO: Remove the second unwrap here as it could potentially lead to a crash
-                let elapsed = send_instants
-                    .read()
-                    .unwrap()
-                    .get(&last_received_serial)
-                    .unwrap()
-                    .elapsed();
-                log::trace!("upper bound on delay from `{}` is {:#?}", src, elapsed);
-            }
-
-            // Decode the received samples back to u16 and add them to the peer's producer for
-            // playback
-            if let Some(producer) = producers.write().unwrap().get_mut(&peer.addr) {
-                producer.push_iter(
-                    // The number of sample bytes is the total received buffer length minus the 4
-                    // bytes used for serial and last_received_serial
-                    &mut sample_bytes[..amt - 4]
-                        .chunks_exact(2)
-                        .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
-                );
-            }
-        }
+        std::thread::park()
     }
 }

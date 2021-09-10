@@ -3,7 +3,6 @@ use std::hash::Hash;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use fragile::Fragile;
-use ringbuf::RingBuffer;
 
 pub struct OutputManager<T: Eq + Hash> {
     device: cpal::Device,
@@ -59,19 +58,10 @@ impl<T: Eq + Hash> OutputManager<T> {
         }
     }
 
-    /// Creates a new stream for the given identifier and returns the producer half of its buffer.
+    /// Creates a new stream for the given identifier, playing data from the provided buffer.
     ///
-    /// The stream starts playing immediately. Use the returned producer half to add samples to be
-    /// played.
-    #[must_use]
-    pub fn add(&mut self, ident: T) -> ringbuf::Producer<u16> {
-        // Create a ring buffer for the new output stream
-        // TODO: Should probably come up with a value other than just guessing
-        let buffer = RingBuffer::new(2048);
-
-        // Split the buffer into a producer and consumer
-        let (producer, consumer) = buffer.split();
-
+    /// The stream starts playing immediately.
+    pub fn add(&mut self, ident: T, consumer: ringbuf::Consumer<u16>) {
         // Use a function to build the data function to be used by the new output stream in order
         // to make it generic over the sample type
         fn build_data_fn<T: cpal::Sample>(
@@ -79,7 +69,7 @@ impl<T: Eq + Hash> OutputManager<T> {
         ) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) {
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 for sample in data {
-                    // Play data from the ring buffer. If the buffer contains no more data, play
+                    // Play data from the buffer. If the buffer contains no more data, play
                     // silence.
                     *sample = match consumer.pop() {
                         Some(sample) => cpal::Sample::from(&sample),
@@ -116,9 +106,6 @@ impl<T: Eq + Hash> OutputManager<T> {
 
         // Store the stream so it doesn't drop immediately
         self.streams.insert(ident, Fragile::new(stream));
-
-        // Return the producer half of the ring buffer
-        producer
     }
 
     /// Removes the output stream associated with the given identifier.
