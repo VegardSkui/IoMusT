@@ -29,13 +29,13 @@ class MainWindow(QMainWindow):
         )
 
         # Open a UDP socket and send all audio input to 127.0.0.1:9898
-        input = QAudioInput(format)
+        self._input = QAudioInput(format)
         self._socket = QUdpSocket()
         self._socket.connectToHost("127.0.0.1", 9898)
-        self._device = input.start(self._socket)
+        self._device = self._input.start(self._socket)
 
         # Log the input buffer size used, note that the actual buffer size is unknown until `start()` is called
-        logging.debug(f"Using audio input buffer size of {input.bufferSize()} bytes")
+        logging.debug(f"Using audio input buffer size of {self._input.bufferSize()} bytes")
 
 
 if __name__ == "__main__":

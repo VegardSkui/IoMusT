@@ -35,11 +35,11 @@ class PeerAudioPlayer(QObject):
             f"Using audio output device `{info.deviceName()}` with format `{format}`"
         )
 
-        output = QAudioOutput(format)
-        self._device = output.start()
+        self._output = QAudioOutput(format)
+        self._device = self._output.start()
 
         # Log the output buffer size used, note that the actual buffer size is unknown until `start()` is called
-        logging.debug(f"Using audio output buffer size of {output.bufferSize()} bytes")
+        logging.debug(f"Using audio output buffer size of {self._output.bufferSize()} bytes")
 
         self._socket.readyRead.connect(self.play_data)
 
