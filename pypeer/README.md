@@ -1,0 +1,3 @@
+# PyPeer
+
+Requires PySide2.
