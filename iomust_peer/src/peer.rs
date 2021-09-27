@@ -97,13 +97,17 @@ impl PeerCommunicator {
                             }
                         }
                         Ok(PeerMessageKind::Pong) => {
+                            // Read the ping time contained in the returned pong message
                             let ping_time = std::time::Duration::from_micros(u64::from_le_bytes(
                                 buf[..8].try_into().unwrap(),
                             ));
+
+                            // Calculate the total round-trip time
                             let rtt = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
                                 .unwrap()
                                 - ping_time;
+
                             log::trace!("round-trip time to `{}` is {:#?}", src, rtt);
                         }
                         Err(err) => log::warn!("could not parse received peer message: `{}`", err),
@@ -185,6 +189,7 @@ impl PeerCommunicator {
     }
 }
 
+/// Sends a message prefixed with a [`PeerMessageKind`] over UDP.
 fn send_message(
     socket: &UdpSocket,
     addr: &SocketAddr,
