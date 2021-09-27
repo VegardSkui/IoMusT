@@ -1,8 +1,29 @@
 use std::collections::HashMap;
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, SystemTime};
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum PeerMessageKind {
+    Audio = 0,
+    Ping = 1,
+    Pong = 2,
+}
+
+impl TryFrom<u8> for PeerMessageKind {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(PeerMessageKind::Audio),
+            1 => Ok(PeerMessageKind::Ping),
+            2 => Ok(PeerMessageKind::Pong),
+            _ => Err("unknown peer message kind"),
+        }
+    }
+}
 
 /// A peer communicator.
 ///
@@ -11,12 +32,9 @@ use std::time::Instant;
 pub struct PeerCommunicator {
     /// The number of input audio channels.
     channels: cpal::ChannelCount,
-    /// All currently connected peers. The key is the audio address of the peer, and the value is a
-    /// tuple of the producer half of its associated audio output buffer and the serial number of
-    /// our last received audio packet from them.
-    peers: Arc<Mutex<HashMap<SocketAddr, (ringbuf::Producer<u16>, u16)>>>,
-    send_instants: Arc<Mutex<HashMap<u16, Instant>>>,
-    serial: u16,
+    /// All currently connected peers. The key is the audio address of the peer, and the value is
+    // the producer half of its associated audio output buffer.
+    peers: Arc<Mutex<HashMap<SocketAddr, ringbuf::Producer<u16>>>>,
     /// The UDP socket used for peer communication.
     socket: UdpSocket,
 }
@@ -30,28 +48,23 @@ impl PeerCommunicator {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         log::info!("bound to `{}`", socket.local_addr().unwrap());
 
-        let peers = Arc::new(Mutex::new(HashMap::<
-            SocketAddr,
-            (ringbuf::Producer<u16>, u16),
-        >::new()));
-
-        let send_instants = Arc::new(Mutex::new(HashMap::<u16, Instant>::new()));
+        let peers = Arc::new(Mutex::new(
+            HashMap::<SocketAddr, ringbuf::Producer<u16>>::new(),
+        ));
 
         // Spawn a new thread to read incoming packets from out peers
         std::thread::spawn({
-            let send_instants = send_instants.clone();
             let socket = socket.try_clone().expect("could not clone socket");
             let peers = peers.clone();
             move || loop {
-                // buffer size of 256 * 2 channels * 2 bytes per sample + 2 bytes for series + 2
-                // bytes for last received series
+                // buffer size of 256 * 2 channels * 2 bytes per sample + 1 byte for message kind
                 // TODO: This should probably be somewhat dynamic to support unknown buffer sized
                 // for our peers. Alternatively we can `expect` the input buffer size to be less
                 // than a given value when configuring the input, and then use that maximum size of
                 // buffer here. It should not be unbounded dynamic as that opens us up to memory
                 // exhaustion attacks. If we see an input configuration larger than the maximum
                 // supported audio packet size we could split it across multiple packets.
-                let mut buf = [0; 256 * 2 * 2 + 2 + 2];
+                let mut buf = [0; 256 * 2 * 2 + 1];
                 let (amt, src) = match socket.recv_from(&mut buf) {
                     Ok((amt, src)) => (amt, src),
                     Err(e) => {
@@ -61,51 +74,75 @@ impl PeerCommunicator {
                 };
 
                 // Skip packets not from one of our peers
-                if let Some((producer, last_received_serial)) = peers.lock().unwrap().get_mut(&src)
-                {
-                    let (serial_bytes, buf) = buf.split_at(2);
-                    let (last_received_serial_bytes, sample_bytes) = buf.split_at(2);
+                if let Some(producer) = peers.lock().unwrap().get_mut(&src) {
+                    let (kind, buf) = buf.split_first().expect("received empty buffer");
+                    match (*kind).try_into() {
+                        Ok(PeerMessageKind::Audio) => {
+                            // Decode the received samples back to u16 and add them to the peer's
+                            // producer for playback
+                            producer.push_iter(
+                                // The number of sample bytes is the total received buffer length
+                                // minus the byte used for the message kind
+                                &mut buf[..amt - 1]
+                                    .chunks_exact(2)
+                                    .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
+                            );
+                        }
+                        Ok(PeerMessageKind::Ping) => {
+                            // Return whatever was received in the ping message to the sender
+                            if let Err(err) =
+                                send_message(&socket, &src, PeerMessageKind::Pong, &buf[..amt - 1])
+                            {
+                                log::error!("sending pong failed: {}", err);
+                            }
+                        }
+                        Ok(PeerMessageKind::Pong) => {
+                            // Read the ping time contained in the returned pong message
+                            let ping_time = std::time::Duration::from_micros(u64::from_le_bytes(
+                                buf[..8].try_into().unwrap(),
+                            ));
 
-                    *last_received_serial = u16::from_le_bytes(serial_bytes.try_into().unwrap());
+                            // Calculate the total round-trip time
+                            let rtt = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap()
+                                - ping_time;
 
-                    // Print the upper bound on delay using the time difference from when we sent a
-                    // sample to when we received a sample where the last received sample of our
-                    // peer is that sample. This will print a huge overestimate if one of the
-                    // packets we measure are lost or the next is received by our peer before they
-                    // get to send out a packet with last_received_series set to our measurement
-                    // series.
-                    let last_received_serial =
-                        u16::from_le_bytes(last_received_serial_bytes.try_into().unwrap());
-                    if last_received_serial.trailing_zeros() >= 10 && last_received_serial != 0 {
-                        // TODO: Remove the second unwrap here as it could potentially lead to a
-                        // crash
-                        let elapsed = send_instants
-                            .lock()
-                            .unwrap()
-                            .get(&last_received_serial)
-                            .unwrap()
-                            .elapsed();
-                        log::trace!("upper bound on delay from `{}` is {:#?}", src, elapsed);
+                            log::trace!("round-trip time to `{}` is {:#?}", src, rtt);
+                        }
+                        Err(err) => log::warn!("could not parse received peer message: `{}`", err),
                     }
-
-                    // Decode the received samples back to u16 and add them to the peer's producer
-                    // for playback
-                    producer.push_iter(
-                        // The number of sample bytes is the total received buffer length minus the
-                        // 4 bytes used for serial and last_received_serial
-                        &mut sample_bytes[..amt - 4]
-                            .chunks_exact(2)
-                            .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
-                    );
                 }
+            }
+        });
+
+        // Start another thread to ping each of our peers in regular intervals
+        std::thread::spawn({
+            let socket = socket.try_clone().expect("could not clone socket");
+            let peers = peers.clone();
+            move || loop {
+                for peer in peers.lock().unwrap().keys() {
+                    let time = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap();
+                    if let Err(err) = send_message(
+                        &socket,
+                        peer,
+                        PeerMessageKind::Ping,
+                        &time.as_micros().to_le_bytes(),
+                    ) {
+                        log::error!("sending ping failed: {}", err);
+                    }
+                }
+
+                // Sleep the thread until the next round of pings
+                std::thread::sleep(Duration::from_secs(5));
             }
         });
 
         Ok(PeerCommunicator {
             channels,
             peers,
-            send_instants,
-            serial: 0,
             socket,
         })
     }
@@ -117,15 +154,6 @@ impl PeerCommunicator {
 
     /// Sends audio samples to all connected peers.
     pub fn send_samples<T: cpal::Sample>(&mut self, samples: &[T]) -> Result<(), std::io::Error> {
-        // Store the instant the input is received (before processing and sending) for every 2^10 =
-        // 1024 input
-        if self.serial.trailing_zeros() >= 10 {
-            self.send_instants
-                .lock()
-                .unwrap()
-                .insert(self.serial, Instant::now());
-        }
-
         // Downmix the audio to mono and convert to a little-endian byte vector
         let sample_bytes: Vec<u8> = samples
             .chunks(self.channels.into())
@@ -138,18 +166,9 @@ impl PeerCommunicator {
         // Compiler Explorer, godbolt.org)
 
         // Send the data to each peer
-        for (addr, (_, last_received_serial)) in self.peers.lock().unwrap().iter() {
-            let payload = [
-                &self.serial.to_le_bytes(),
-                &last_received_serial.to_le_bytes(),
-                sample_bytes.as_slice(),
-            ]
-            .concat();
-            self.socket.send_to(&payload, &addr)?;
+        for addr in self.peers.lock().unwrap().keys() {
+            send_message(&self.socket, addr, PeerMessageKind::Audio, &sample_bytes)?;
         }
-
-        // Increment the serial number, wrapping around on overflow
-        self.serial = self.serial.wrapping_add(1);
 
         Ok(())
     }
@@ -159,7 +178,7 @@ impl PeerCommunicator {
     /// This will start accepting datagrams from the given address and push received audio data to
     /// its associated buffer.
     pub fn add(&mut self, addr: SocketAddr, producer: ringbuf::Producer<u16>) {
-        self.peers.lock().unwrap().insert(addr, (producer, 0));
+        self.peers.lock().unwrap().insert(addr, producer);
     }
 
     /// Removes a peer by address.
@@ -168,4 +187,15 @@ impl PeerCommunicator {
     pub fn remove(&mut self, addr: &SocketAddr) {
         self.peers.lock().unwrap().remove(addr);
     }
+}
+
+/// Sends a message prefixed with a [`PeerMessageKind`] over UDP.
+fn send_message(
+    socket: &UdpSocket,
+    addr: &SocketAddr,
+    kind: PeerMessageKind,
+    content: &[u8],
+) -> Result<(), std::io::Error> {
+    socket.send_to(&[&[kind as u8], content].concat(), addr)?;
+    Ok(())
 }
