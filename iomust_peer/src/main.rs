@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 
+use clap::{crate_name, crate_version, App, Arg};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iomust_signaling_messages::{ClientMessage, ServerMessage};
 use ringbuf::RingBuffer;
@@ -18,9 +20,36 @@ fn main() {
     env_logger::init();
     log::info!("launching iomust_peer");
 
-    let signaling_server_addr = std::env::args()
-        .nth(1)
-        .expect("missing signaling server address argument");
+    let matches = App::new(crate_name!())
+        .version(crate_version!())
+        .after_help("-p and -s are mutually exclusive, use only one at a time.\n\n\
+                     It is useful to set the peer communicaiton address manually with -a when\n\
+                     connecting to peers using -p such that you know (and can share) your own address\n\
+                     before launching the program.")
+        .arg(
+            Arg::with_name("addr")
+                .short("a")
+                .default_value("0.0.0.0:0")
+                .help("Peer communication address"),
+        )
+        .arg(
+            Arg::with_name("peer")
+                .short("p")
+                .multiple(true)
+                .takes_value(true)
+                .required(true)
+                .conflicts_with("signaling_server")
+                .help("Peer addresses"),
+        )
+        .arg(
+            Arg::with_name("signaling_server")
+                .short("s")
+                .takes_value(true)
+                .required(true)
+                .conflicts_with("peer")
+                .help("Signaling server address"),
+        )
+        .get_matches();
 
     // Get the default audio host
     let host = cpal::default_host();
@@ -79,8 +108,13 @@ fn main() {
 
     // Initialize a peer communicator
     let peer_comm = Arc::new(RwLock::new(
-        PeerCommunicator::initialize(input_stream_config.channels)
-            .expect("initializing peer communicator failed"),
+        // The `addr` option should always have a value since we've set a default, thus the
+        // associated call to expect should never materialize
+        PeerCommunicator::initialize(
+            matches.value_of("addr").expect("missing address"),
+            input_stream_config.channels,
+        )
+        .expect("initializing peer communicator failed"),
     ));
 
     // Use a function to build the data function for the input stream in order to make it generic
@@ -120,41 +154,68 @@ fn main() {
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
-    // Connect to the signaling server
-    let signaling_conn = SignalingConnection::connect(signaling_server_addr)
-        .expect("could not connect to the signaling server");
+    let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
 
-    // Handle incoming messages from the signaling server
-    signaling_conn.set_callback({
-        let peer_comm = peer_comm.clone();
-        let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
-        move |message: ServerMessage| match message {
-            ServerMessage::Connected { addr } => {
-                log::info!("peer `{}` connected", addr);
-                // Create a new output buffer for the peer
-                // TODO: Come up with a buffer capacity without mostly guessing
-                let (producer, consumer) = RingBuffer::new(2048).split();
-                peer_comm.write().unwrap().add(addr, producer);
-                output_manager.add(addr, consumer);
-            }
-            ServerMessage::Disconnected { addr } => {
-                log::info!("peer `{}` disconnected", addr);
-                peer_comm.write().unwrap().remove(&addr);
-                output_manager.remove(&addr);
-            }
-        }
-    });
+    // Connect each of the provided peer addresses
+    if let Some(addrs) = matches.values_of("peer") {
+        addrs
+            .map(|addr| SocketAddr::from_str(addr).expect("failed to parse peer address"))
+            .for_each(|addr| connect_peer(&peer_comm, &mut output_manager, addr));
+    }
 
-    // Send a hey message to the signaling server to connect us with other peers
-    signaling_conn
-        .send(&ClientMessage::Hey {
-            name: String::from("Unnamed Peer"),
-            port: peer_comm.read().unwrap().local_addr().unwrap().port(),
-        })
-        .expect("sending hey message to the signaling server failed");
+    // Connect to the signaling server if an address was provided
+    if let Some(addr) = matches.value_of("signaling_server") {
+        // Connect to the signaling server
+        let signaling_conn =
+            SignalingConnection::connect(addr).expect("could not connect to the signaling server");
+
+        // Handle incoming messages from the signaling server
+        signaling_conn.set_callback({
+            let peer_comm = peer_comm.clone();
+            move |message: ServerMessage| match message {
+                ServerMessage::Connected { addr } => {
+                    connect_peer(&peer_comm, &mut output_manager, addr)
+                }
+                ServerMessage::Disconnected { addr } => {
+                    disconnect_peer(&peer_comm, &mut output_manager, addr)
+                }
+            }
+        });
+
+        // Send a hey message to the signaling server to connect us with other peers
+        signaling_conn
+            .send(&ClientMessage::Hey {
+                name: String::from("Unnamed Peer"),
+                port: peer_comm.read().unwrap().local_addr().unwrap().port(),
+            })
+            .expect("sending hey message to the signaling server failed");
+    }
 
     // This main thread has nothing more to do, so park it indefinitely
     loop {
         std::thread::park()
     }
+}
+
+fn connect_peer(
+    peer_comm: &Arc<RwLock<PeerCommunicator>>,
+    output_manager: &mut OutputManager<SocketAddr>,
+    addr: SocketAddr,
+) {
+    log::info!("connecting peer `{}`", addr);
+    // Create a new output buffer for the peer
+    // TODO: Come up with a buffer capacity without mostly guessing
+    let (producer, consumer) = RingBuffer::new(2048).split();
+    peer_comm.write().unwrap().add(addr, producer);
+    output_manager.add(addr, consumer);
+}
+
+fn disconnect_peer(
+    peer_comm: &Arc<RwLock<PeerCommunicator>>,
+    output_manager: &mut OutputManager<SocketAddr>,
+    addr: SocketAddr,
+) {
+    log::info!("disconnecting peer `{}`", addr);
+    peer_comm.write().unwrap().remove(&addr);
+    output_manager.remove(&addr);
 }
