@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -43,9 +43,9 @@ impl PeerCommunicator {
     /// Initializes a new peer communicator to listen for audio data received from peers.
     ///
     /// This will also automatically start a new thread to listen for incoming data from peers.
-    pub fn initialize(channels: cpal::ChannelCount) -> Result<Self, std::io::Error> {
+    pub fn initialize<A: ToSocketAddrs>(addr: A, channels: cpal::ChannelCount) -> Result<Self, std::io::Error> {
         // Bind a UDP socket
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        let socket = UdpSocket::bind(addr)?;
         log::info!("bound to `{}`", socket.local_addr().unwrap());
 
         let peers = Arc::new(Mutex::new(
