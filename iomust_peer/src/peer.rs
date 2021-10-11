@@ -154,16 +154,13 @@ impl PeerCommunicator {
 
     /// Sends audio samples to all connected peers.
     pub fn send_samples<T: cpal::Sample>(&mut self, samples: &[T]) -> Result<(), std::io::Error> {
-        // Downmix the audio to mono and convert to a little-endian byte vector
+        // Downmix the audio to mono by taking the value of the first channel and convert to a
+        // little-endian byte vector. The endianness conversion is a no-op on little-endian
+        // systems.
         let sample_bytes: Vec<u8> = samples
             .chunks(self.channels.into())
             .flat_map(|samples| samples[0].to_u16().to_le_bytes())
             .collect();
-
-        // NOTE: As long as we agree on the native endianess we could skip the above conversion and
-        // just transmute the type of "data".
-        // But this should just be a no-op if it matches anyways? Can we verify this? (maybe with
-        // Compiler Explorer, godbolt.org)
 
         // Send the data to each peer
         for addr in self.peers.lock().unwrap().keys() {
