@@ -17,7 +17,7 @@ mod signaling;
 
 fn main() {
     // Initialize logging
-    env_logger::init();
+    env_logger::builder().format_timestamp_millis().init();
     log::info!("launching iomust_peer");
 
     let matches = App::new(crate_name!())
