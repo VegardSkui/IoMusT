@@ -39,7 +39,7 @@ fn main() {
                 .takes_value(true)
                 .required(true)
                 .conflicts_with("signaling_server")
-                .help("Peer addresses"),
+                .help("Peers"),
         )
         .arg(
             Arg::with_name("signaling_server")
@@ -156,11 +156,16 @@ fn main() {
 
     let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
 
-    // Connect each of the provided peer addresses
-    if let Some(addrs) = matches.values_of("peer") {
-        addrs
-            .map(|addr| SocketAddr::from_str(addr).expect("failed to parse peer address"))
-            .for_each(|addr| connect_peer(&peer_comm, &mut output_manager, addr));
+    // Connect each of the provided peers
+    if let Some(peers) = matches.values_of("peer") {
+        for peer in peers {
+            let (addr, sample_rate) = peer.split_once(',').expect("invalid peer format");
+            let addr = SocketAddr::from_str(addr).expect("failed to parse peer address");
+            let sample_rate = sample_rate
+                .parse::<u32>()
+                .expect("failed to parse peer sample rate");
+            connect_peer(&peer_comm, &mut output_manager, addr, sample_rate);
+        }
     }
 
     // Connect to the signaling server if an address was provided
@@ -173,8 +178,8 @@ fn main() {
         signaling_conn.set_callback({
             let peer_comm = peer_comm.clone();
             move |message: ServerMessage| match message {
-                ServerMessage::Connected { addr } => {
-                    connect_peer(&peer_comm, &mut output_manager, addr)
+                ServerMessage::Connected { addr, sample_rate } => {
+                    connect_peer(&peer_comm, &mut output_manager, addr, sample_rate)
                 }
                 ServerMessage::Disconnected { addr } => {
                     disconnect_peer(&peer_comm, &mut output_manager, addr)
@@ -187,6 +192,7 @@ fn main() {
             .send(&ClientMessage::Hey {
                 name: String::from("Unnamed Peer"),
                 port: peer_comm.read().unwrap().local_addr().unwrap().port(),
+                sample_rate: input_stream_config.sample_rate.0,
             })
             .expect("sending hey message to the signaling server failed");
     }
@@ -201,13 +207,14 @@ fn connect_peer(
     peer_comm: &Arc<RwLock<PeerCommunicator>>,
     output_manager: &mut OutputManager<SocketAddr>,
     addr: SocketAddr,
+    sample_rate: u32,
 ) {
     log::info!("connecting peer `{}`", addr);
     // Create a new output buffer for the peer
     // TODO: Come up with a buffer capacity without mostly guessing
     let (producer, consumer) = RingBuffer::new(2048).split();
     peer_comm.write().unwrap().add(addr, producer);
-    output_manager.add(addr, consumer);
+    output_manager.add(addr, cpal::SampleRate(sample_rate), consumer);
 }
 
 fn disconnect_peer(
