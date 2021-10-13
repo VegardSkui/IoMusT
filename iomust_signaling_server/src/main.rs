@@ -9,6 +9,7 @@ struct Peer {
     /// The audio UDP address of the peer. The existence of this address is equivalent to the peer
     /// being connected.
     addr: Option<SocketAddr>,
+    sample_rate: Option<u32>,
     stream: TcpStream,
 }
 
@@ -91,7 +92,11 @@ fn main() {
                 match message {
                     ClientMessage::Alive => todo!(),
                     ClientMessage::Bye => todo!(),
-                    ClientMessage::Hey { name, port } => {
+                    ClientMessage::Hey {
+                        name,
+                        port,
+                        sample_rate,
+                    } => {
                         // TODO: Make sure the peer isn't already connected with audio
 
                         // The actual audio address of the peer is it's source address and the
@@ -112,19 +117,21 @@ fn main() {
                                 // peer
                                 let message = ServerMessage::Connected {
                                     addr: peer_audio_addr,
+                                    sample_rate: peer.sample_rate.expect("missing sample_rate"),
                                 };
                                 outgoing.push((source_addr, message));
 
                                 // Send a message to all already connected peers about the newly
                                 // connected peer
-                                let message = ServerMessage::Connected { addr };
+                                let message = ServerMessage::Connected { addr, sample_rate };
                                 outgoing.push((*peer_addr, message));
                             }
                         }
 
-                        // Store the audio address for the peer
+                        // Store the audio address and sample rate for the peer
                         if let Some(peer) = peers.get_mut(&source_addr) {
                             peer.addr = Some(addr);
+                            peer.sample_rate = Some(sample_rate);
                         }
                     }
                 }
@@ -165,7 +172,11 @@ fn main() {
                     .expect("set_nonblocking call failed");
 
                 // Store the peer
-                let peer = Peer { addr: None, stream };
+                let peer = Peer {
+                    addr: None,
+                    sample_rate: None,
+                    stream,
+                };
                 peers.write().unwrap().insert(addr, peer);
             }
             Err(e) => log::warn!("connection failed: {}", e),

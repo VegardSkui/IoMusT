@@ -8,13 +8,17 @@ use serde::{Deserialize, Serialize};
 pub enum ClientMessage {
     Alive,
     Bye,
-    Hey { name: String, port: u16 },
+    Hey {
+        name: String,
+        port: u16,
+        sample_rate: u32,
+    },
 }
 
 /// Messages sent from the signaling server to the clients.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ServerMessage {
-    Connected { addr: SocketAddr },
+    Connected { addr: SocketAddr, sample_rate: u32 },
     Disconnected { addr: SocketAddr },
 }

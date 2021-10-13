@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 
 use cpal::traits::{DeviceTrait, StreamTrait};
+use dasp::{Frame, Signal};
 use fragile::Fragile;
 
 pub struct OutputManager<T: Eq + Hash> {
@@ -61,21 +62,32 @@ impl<T: Eq + Hash> OutputManager<T> {
     /// Creates a new stream for the given identifier, playing data from the provided buffer.
     ///
     /// The stream starts playing immediately.
-    pub fn add(&mut self, ident: T, consumer: ringbuf::Consumer<u16>) {
+    pub fn add(
+        &mut self,
+        ident: T,
+        sample_rate: cpal::SampleRate,
+        consumer: ringbuf::Consumer<u16>,
+    ) {
         // Use a function to build the data function to be used by the new output stream in order
         // to make it generic over the sample type
         fn build_data_fn<T: cpal::Sample>(
-            mut consumer: ringbuf::Consumer<u16>,
+            consumer: ringbuf::Consumer<u16>,
             channels: cpal::ChannelCount,
+            source_sample_rate: cpal::SampleRate,
+            target_sample_rate: cpal::SampleRate,
         ) -> impl FnMut(&mut [T], &cpal::OutputCallbackInfo) {
+            // Create a signal from the consumer half of the ring buffer and interpolate it to
+            // match the required output sample rate
+            let mut signal = ConsumerSignal::new(consumer).from_hz_to_hz(
+                dasp::interpolate::linear::Linear::new([0], [0]),
+                source_sample_rate.0.into(),
+                target_sample_rate.0.into(),
+            );
+
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                 for frame in data.chunks_mut(channels.into()) {
-                    // Pop a sample from the buffer, if the buffer contains no more data, play
-                    // silence
-                    let sample = match consumer.pop() {
-                        Some(sample) => cpal::Sample::from(&sample),
-                        None => cpal::Sample::from(&0.0),
-                    };
+                    // Create a sample from the first (and only) sample in the next frame
+                    let sample = cpal::Sample::from(&signal.next()[0]);
 
                     // Play the sample on every channel in the frame
                     frame.fill(sample);
@@ -89,17 +101,32 @@ impl<T: Eq + Hash> OutputManager<T> {
         let stream = match self.sample_format {
             cpal::SampleFormat::I16 => self.device.build_output_stream(
                 &self.stream_config,
-                build_data_fn::<i16>(consumer, self.stream_config.channels),
+                build_data_fn::<i16>(
+                    consumer,
+                    self.stream_config.channels,
+                    sample_rate,
+                    self.stream_config.sample_rate,
+                ),
                 err_fn,
             ),
             cpal::SampleFormat::U16 => self.device.build_output_stream(
                 &self.stream_config,
-                build_data_fn::<u16>(consumer, self.stream_config.channels),
+                build_data_fn::<u16>(
+                    consumer,
+                    self.stream_config.channels,
+                    sample_rate,
+                    self.stream_config.sample_rate,
+                ),
                 err_fn,
             ),
             cpal::SampleFormat::F32 => self.device.build_output_stream(
                 &self.stream_config,
-                build_data_fn::<f32>(consumer, self.stream_config.channels),
+                build_data_fn::<f32>(
+                    consumer,
+                    self.stream_config.channels,
+                    sample_rate,
+                    self.stream_config.sample_rate,
+                ),
                 err_fn,
             ),
         }
@@ -118,5 +145,31 @@ impl<T: Eq + Hash> OutputManager<T> {
     pub fn remove(&mut self, ident: &T) {
         // Drop the output stream
         self.streams.remove(ident);
+    }
+}
+
+/// Creates a signal by reading samples from the consumer half of a ring buffer.
+///
+/// When `next` is called, `ConsumerSignal` will try to pop a sample off the buffer. If there are
+/// no more samples, the signal will yield silent frames. The signal will always provide mono
+/// frames, and each sample provided by the buffer must constitute a mono frame.
+struct ConsumerSignal {
+    consumer: ringbuf::Consumer<u16>,
+}
+
+impl ConsumerSignal {
+    fn new(consumer: ringbuf::Consumer<u16>) -> Self {
+        ConsumerSignal { consumer }
+    }
+}
+
+impl Signal for ConsumerSignal {
+    type Frame = dasp::frame::Mono<u16>;
+
+    fn next(&mut self) -> Self::Frame {
+        match self.consumer.pop() {
+            Some(sample) => [sample],
+            None => Self::Frame::EQUILIBRIUM,
+        }
     }
 }
