@@ -48,7 +48,7 @@ impl SignalingConnection {
         Ok(SignalingConnection { stream, callback })
     }
 
-    /// Sends a `ClientMessage` to the signaling server.
+    /// Sends a [`ClientMessage`] to the signaling server.
     pub fn send(&self, message: &ClientMessage) -> Result<(), serde_json::Error> {
         let stream = self.stream.try_clone().expect("could not clone stream");
         serde_json::to_writer(stream, message)?;

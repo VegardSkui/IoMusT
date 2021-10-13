@@ -33,7 +33,7 @@ pub struct PeerCommunicator {
     /// The number of input audio channels.
     channels: cpal::ChannelCount,
     /// All currently connected peers. The key is the audio address of the peer, and the value is
-    // the producer half of its associated audio output buffer.
+    /// the producer half of its associated audio output buffer.
     peers: Arc<Mutex<HashMap<SocketAddr, ringbuf::Producer<u16>>>>,
     /// The UDP socket used for peer communication.
     socket: UdpSocket,
@@ -43,7 +43,10 @@ impl PeerCommunicator {
     /// Initializes a new peer communicator to listen for audio data received from peers.
     ///
     /// This will also automatically start a new thread to listen for incoming data from peers.
-    pub fn initialize<A: ToSocketAddrs>(addr: A, channels: cpal::ChannelCount) -> Result<Self, std::io::Error> {
+    pub fn initialize<A: ToSocketAddrs>(
+        addr: A,
+        channels: cpal::ChannelCount,
+    ) -> Result<Self, std::io::Error> {
         // Bind a UDP socket
         let socket = UdpSocket::bind(addr)?;
         log::info!("bound to `{}`", socket.local_addr().unwrap());
