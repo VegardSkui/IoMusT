@@ -4,6 +4,8 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use serde::Serialize;
+
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum PeerMessageKind {
@@ -23,6 +25,17 @@ impl TryFrom<u8> for PeerMessageKind {
             _ => Err("unknown peer message kind"),
         }
     }
+}
+
+/// A round-trip time measurement record.
+#[derive(Debug, Serialize)]
+struct RttRecord {
+    /// Unix timestamp for when the ping message was sent.
+    ping_time: u64,
+    /// Address of the peer.
+    peer: SocketAddr,
+    /// The measured round-trip time in seconds.
+    rtt: f32,
 }
 
 /// A peer communicator.
@@ -57,6 +70,12 @@ impl PeerCommunicator {
 
         // Spawn a new thread to read incoming packets from out peers
         std::thread::spawn({
+            // Create a CSV writer for round-trip time measurements
+            let rtt_path = format!("rtt-{}.csv", epoch_time().as_secs());
+            log::info!("writing rtt measurements to `{}`", rtt_path);
+            let mut rtt_writer = csv::Writer::from_path(rtt_path)
+                .expect("could not create csv writer for rtt measurements");
+
             let socket = socket.try_clone().expect("could not clone socket");
             let peers = peers.clone();
             move || loop {
@@ -106,12 +125,22 @@ impl PeerCommunicator {
                             ));
 
                             // Calculate the total round-trip time
-                            let rtt = SystemTime::now()
-                                .duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap()
-                                - ping_time;
+                            let rtt = epoch_time() - ping_time;
 
                             log::trace!("round-trip time to `{}` is {:#?}", src, rtt);
+
+                            // Write the measurement to the CSV file
+                            rtt_writer
+                                .serialize(RttRecord {
+                                    ping_time: ping_time.as_secs(),
+                                    peer: src,
+                                    rtt: rtt.as_secs_f32(),
+                                })
+                                .expect("failed to serialize rtt measurement");
+
+                            // Flush the writer immediately so we don't miss any measurements when
+                            // we are shut down
+                            rtt_writer.flush().expect("failed to flush rtt csv writer");
                         }
                         Err(err) => log::warn!("could not parse received peer message: `{}`", err),
                     }
@@ -125,14 +154,11 @@ impl PeerCommunicator {
             let peers = peers.clone();
             move || loop {
                 for peer in peers.lock().unwrap().keys() {
-                    let time = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap();
                     if let Err(err) = send_message(
                         &socket,
                         peer,
                         PeerMessageKind::Ping,
-                        &time.as_micros().to_le_bytes(),
+                        &epoch_time().as_micros().to_le_bytes(),
                     ) {
                         log::error!("sending ping failed: {}", err);
                     }
@@ -187,6 +213,15 @@ impl PeerCommunicator {
     pub fn remove(&mut self, addr: &SocketAddr) {
         self.peers.lock().unwrap().remove(addr);
     }
+}
+
+/// Returns the current Unix time from the current system time.
+fn epoch_time() -> Duration {
+    // This unwrap should never fail because the current system time should always be significantly
+    // larger than the Unix epoch
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
 }
 
 /// Sends a message prefixed with a [`PeerMessageKind`] over UDP.

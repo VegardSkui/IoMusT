@@ -6,11 +6,12 @@ edition = "2018"
 [dependencies]
 clap = "2.33"
 cpal = "0.13"
+csv = "1.1"
 dasp = { version = "0.11", features = ["interpolate", "interpolate-linear", "signal"] }
 env_logger = "0.9"
 fragile = "1.0"
 iomust_signaling_messages = { path = "../iomust_signaling_messages" }
 log = "0.4"
 ringbuf = "0.2"
-serde = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
