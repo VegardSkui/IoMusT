@@ -49,7 +49,7 @@ pub struct PeerCommunicator {
     /// the producer half of its associated audio output buffer.
     peers: Arc<Mutex<HashMap<SocketAddr, ringbuf::Producer<u16>>>>,
     /// The UDP socket used for peer communication.
-    socket: UdpSocket,
+    pub(crate) socket: UdpSocket,
 }
 
 impl PeerCommunicator {
@@ -59,7 +59,7 @@ impl PeerCommunicator {
     pub fn initialize<A: ToSocketAddrs>(
         addr: A,
         channels: cpal::ChannelCount,
-    ) -> Result<Self, std::io::Error> {
+    ) -> std::io::Result<PeerCommunicator> {
         // Bind a UDP socket
         let socket = UdpSocket::bind(addr)?;
         log::info!("bound to `{}`", socket.local_addr().unwrap());
@@ -176,13 +176,8 @@ impl PeerCommunicator {
         })
     }
 
-    /// Returns the local address of the socket used for peer communication.
-    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
-        self.socket.local_addr()
-    }
-
     /// Sends audio samples to all connected peers.
-    pub fn send_samples<T: cpal::Sample>(&mut self, samples: &[T]) -> Result<(), std::io::Error> {
+    pub fn send_samples<T: cpal::Sample>(&mut self, samples: &[T]) -> std::io::Result<()> {
         // Downmix the audio to mono by taking the value of the first channel and convert to a
         // little-endian byte vector. The endianness conversion is a no-op on little-endian
         // systems.

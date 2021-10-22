@@ -3,22 +3,20 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 /// Messages sent from the clients to the signaling server.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ClientMessage {
     Alive,
     Bye,
-    Hey {
-        name: String,
-        port: u16,
-        sample_rate: u32,
-    },
+    Hey { sample_rate: u32 },
 }
 
 /// Messages sent from the signaling server to the clients.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ServerMessage {
-    Connected { addr: SocketAddr, sample_rate: u32 },
-    Disconnected { addr: SocketAddr },
+    Entered { addr: SocketAddr, sample_rate: u32 },
+    Left { addr: SocketAddr },
+    RequestAudioAddress { key: u64 },
+    SuccessfullyEntered,
 }

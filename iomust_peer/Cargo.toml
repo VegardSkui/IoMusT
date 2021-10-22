@@ -9,7 +9,7 @@ cpal = "0.13"
 csv = "1.1"
 dasp = { version = "0.11", features = ["interpolate", "interpolate-linear", "signal"] }
 env_logger = "0.9"
-iomust_signaling_messages = { path = "../iomust_signaling_messages" }
+iomust_messages = { path = "../iomust_messages" }
 log = "0.4"
 ringbuf = "0.2"
 serde = { version = "1.0", features = ["derive"] }

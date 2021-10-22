@@ -1,5 +1,5 @@
 [package]
-name = "iomust_signaling_messages"
+name = "iomust_messages"
 version = "0.1.0"
 edition = "2018"
 
