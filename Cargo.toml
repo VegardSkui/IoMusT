@@ -1,6 +1,6 @@
 [workspace]
 members = [
+    "iomust_messages",
     "iomust_peer",
-    "iomust_signaling_messages",
-    "iomust_signaling_server",
+    "iomust_server",
 ]

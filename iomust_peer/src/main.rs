@@ -1,19 +1,18 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use clap::{crate_name, crate_version, App, Arg};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use iomust_signaling_messages::{ClientMessage, ServerMessage};
 use ringbuf::RingBuffer;
 
 use crate::output::OutputManager;
 use crate::peer::PeerCommunicator;
-use crate::signaling::SignalingConnection;
+use crate::server::ServerConnectionBuilder;
 
 mod output;
 mod peer;
-mod signaling;
+mod server;
 
 fn main() {
     // Initialize logging
@@ -38,16 +37,16 @@ fn main() {
                 .multiple(true)
                 .takes_value(true)
                 .required(true)
-                .conflicts_with("signaling_server")
+                .conflicts_with("server")
                 .help("Peers"),
         )
         .arg(
-            Arg::with_name("signaling_server")
+            Arg::with_name("server")
                 .short("s")
                 .takes_value(true)
                 .required(true)
                 .conflicts_with("peer")
-                .help("Signaling server address"),
+                .help("Server address"),
         )
         .get_matches();
 
@@ -154,7 +153,7 @@ fn main() {
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
-    let output_manager = OutputManager::<SocketAddr>::new(output_device);
+    let output_manager = Arc::new(Mutex::new(OutputManager::<SocketAddr>::new(output_device)));
 
     // Connect each of the provided peers
     if let Some(peers) = matches.values_of("peer") {
@@ -168,33 +167,30 @@ fn main() {
         }
     }
 
-    // Connect to the signaling server if an address was provided
-    if let Some(addr) = matches.value_of("signaling_server") {
-        // Connect to the signaling server
-        let signaling_conn =
-            SignalingConnection::connect(addr).expect("could not connect to the signaling server");
-
-        // Handle incoming messages from the signaling server
-        signaling_conn.set_callback({
-            let peer_comm = peer_comm.clone();
-            move |message: ServerMessage| match message {
-                ServerMessage::Connected { addr, sample_rate } => {
-                    connect_peer(&peer_comm, &output_manager, addr, sample_rate)
+    // Connect to and enter the server if an address was provided
+    if let Some(addr) = matches.value_of("server") {
+        ServerConnectionBuilder::new(addr)
+            .entered_callback({
+                // Connect to peers who enter
+                let peer_comm = peer_comm.clone();
+                let output_manager = Arc::clone(&output_manager);
+                move |addr, sample_rate| {
+                    connect_peer(&peer_comm, &output_manager, addr, sample_rate);
                 }
-                ServerMessage::Disconnected { addr } => {
-                    disconnect_peer(&peer_comm, &output_manager, addr)
-                }
-            }
-        });
-
-        // Send a hey message to the signaling server to connect us with other peers
-        signaling_conn
-            .send(&ClientMessage::Hey {
-                name: String::from("Unnamed Peer"),
-                port: peer_comm.read().unwrap().local_addr().unwrap().port(),
-                sample_rate: input_stream_config.sample_rate.0,
             })
-            .expect("sending hey message to the signaling server failed");
+            .left_callback({
+                // Disconnect from peer who leave
+                let peer_comm = Arc::clone(&peer_comm);
+                let output_manager = Arc::clone(&output_manager);
+                move |addr| {
+                    disconnect_peer(&peer_comm, &output_manager, addr);
+                }
+            })
+            .connect_and_enter(
+                peer_comm.read().unwrap().socket.try_clone().unwrap(),
+                input_stream_config.sample_rate.0,
+            )
+            .expect("failed to connect and enter the iomust server");
     }
 
     // This main thread has nothing more to do, so park it indefinitely
@@ -205,7 +201,7 @@ fn main() {
 
 fn connect_peer(
     peer_comm: &Arc<RwLock<PeerCommunicator>>,
-    output_manager: &OutputManager<SocketAddr>,
+    output_manager: &Arc<Mutex<OutputManager<SocketAddr>>>,
     addr: SocketAddr,
     sample_rate: u32,
 ) {
@@ -214,15 +210,18 @@ fn connect_peer(
     // TODO: Come up with a buffer capacity without mostly guessing
     let (producer, consumer) = RingBuffer::new(2048).split();
     peer_comm.write().unwrap().add(addr, producer);
-    output_manager.add(addr, cpal::SampleRate(sample_rate), consumer);
+    output_manager
+        .lock()
+        .unwrap()
+        .add(addr, cpal::SampleRate(sample_rate), consumer);
 }
 
 fn disconnect_peer(
     peer_comm: &Arc<RwLock<PeerCommunicator>>,
-    output_manager: &OutputManager<SocketAddr>,
+    output_manager: &Arc<Mutex<OutputManager<SocketAddr>>>,
     addr: SocketAddr,
 ) {
     log::info!("disconnecting peer `{}`", addr);
     peer_comm.write().unwrap().remove(&addr);
-    output_manager.remove(addr);
+    output_manager.lock().unwrap().remove(addr);
 }
