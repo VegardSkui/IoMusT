@@ -154,7 +154,7 @@ fn main() {
     // Play the input stream
     input_stream.play().expect("could not play input stream");
 
-    let mut output_manager = OutputManager::<SocketAddr>::new(output_device);
+    let output_manager = OutputManager::<SocketAddr>::new(output_device);
 
     // Connect each of the provided peers
     if let Some(peers) = matches.values_of("peer") {
@@ -164,7 +164,7 @@ fn main() {
             let sample_rate = sample_rate
                 .parse::<u32>()
                 .expect("failed to parse peer sample rate");
-            connect_peer(&peer_comm, &mut output_manager, addr, sample_rate);
+            connect_peer(&peer_comm, &output_manager, addr, sample_rate);
         }
     }
 
@@ -179,10 +179,10 @@ fn main() {
             let peer_comm = peer_comm.clone();
             move |message: ServerMessage| match message {
                 ServerMessage::Connected { addr, sample_rate } => {
-                    connect_peer(&peer_comm, &mut output_manager, addr, sample_rate)
+                    connect_peer(&peer_comm, &output_manager, addr, sample_rate)
                 }
                 ServerMessage::Disconnected { addr } => {
-                    disconnect_peer(&peer_comm, &mut output_manager, addr)
+                    disconnect_peer(&peer_comm, &output_manager, addr)
                 }
             }
         });
@@ -205,7 +205,7 @@ fn main() {
 
 fn connect_peer(
     peer_comm: &Arc<RwLock<PeerCommunicator>>,
-    output_manager: &mut OutputManager<SocketAddr>,
+    output_manager: &OutputManager<SocketAddr>,
     addr: SocketAddr,
     sample_rate: u32,
 ) {
@@ -219,10 +219,10 @@ fn connect_peer(
 
 fn disconnect_peer(
     peer_comm: &Arc<RwLock<PeerCommunicator>>,
-    output_manager: &mut OutputManager<SocketAddr>,
+    output_manager: &OutputManager<SocketAddr>,
     addr: SocketAddr,
 ) {
     log::info!("disconnecting peer `{}`", addr);
     peer_comm.write().unwrap().remove(&addr);
-    output_manager.remove(&addr);
+    output_manager.remove(addr);
 }
