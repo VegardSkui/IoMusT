@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     // Initialize logging
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("launching iomust_server");
 
     // Read the address we should bind to from the program arguments

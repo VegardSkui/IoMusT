@@ -16,7 +16,9 @@ mod server;
 
 fn main() {
     // Initialize logging
-    env_logger::builder().format_timestamp_millis().init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
     log::info!("launching iomust_peer");
 
     let matches = App::new(crate_name!())
