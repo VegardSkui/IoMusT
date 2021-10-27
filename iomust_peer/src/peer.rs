@@ -165,7 +165,7 @@ impl PeerCommunicator {
                 }
 
                 // Sleep the thread until the next round of pings
-                std::thread::sleep(Duration::from_secs(5));
+                std::thread::sleep(Duration::from_secs(1));
             }
         });
 
