@@ -32,7 +32,7 @@ print round-trip time measurements as they are completed.
 
 ## Rust version
 
-`iomust_peer` is developed with Rust 1.56.0.
+`iomust_peer` is developed with Rust 1.56.1.
 
 `iomust_server` is written to support Rust 1.48.0, the latest Rust version
 available in the Debian Bullseye repositories.
